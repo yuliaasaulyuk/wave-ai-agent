@@ -2,7 +2,8 @@
 // Keeps the Gemini API key on the server: set GEMINI_API_KEY in Netlify → Project configuration → Environment variables.
 
 // Model names change over time, so try a few and fall back to whatever "flash" model the key can use.
-const CANDIDATES = [process.env.GEMINI_MODEL, "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"].filter(Boolean);
+// "Lite" models have the most generous free quota and answer fastest — enough for a support chat.
+const CANDIDATES = [process.env.GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-flash-latest"].filter(Boolean);
 let cachedModel = null;
 
 async function listFlash(key) {
@@ -62,7 +63,7 @@ exports.handler = async (event) => {
   const thinking = (model) => /2\.5/.test(model) ? { thinkingBudget: 0 } : { thinkingLevel: "low" };
   const call = async (model, withThinking = true) => {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const timer = setTimeout(() => ctrl.abort(), 7000);
     try {
       const generationConfig = { temperature: 0.2, responseMimeType: "application/json" };
       if (withThinking) generationConfig.thinkingConfig = thinking(model);
@@ -80,19 +81,20 @@ exports.handler = async (event) => {
 
   try {
     const tried = cachedModel ? [cachedModel] : [...CANDIDATES];
-    let listed = false, r = null, lastStatus = 0, used = null;
+    let listed = false, r = null, lastStatus = 0, used = null, lastMsg = "";
     for (let i = 0; i < tried.length; i++) {
       r = await call(tried[i]);
       if (r.ok) { used = tried[i]; break; }
       lastStatus = r.status;
-      if (![404, 400, 408].includes(r.status)) break;
+      if (![404, 400, 408, 429, 500, 503].includes(r.status)) break;
+      try { lastMsg = (await r.json())?.error?.message?.slice(0, 200) || lastMsg; } catch {}
       if (i === tried.length - 1 && !listed) {
         listed = true;
         const more = (await listFlash(key)).filter(m => !tried.includes(m));
         tried.push(...more.slice(0, 3));
       }
     }
-    if (!used) return { statusCode: 502, body: JSON.stringify({ error: "model_error", status: lastStatus }) };
+    if (!used) return { statusCode: 502, body: JSON.stringify({ error: "model_error", status: lastStatus, message: lastMsg }) };
     cachedModel = used;
     const data = await r.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
