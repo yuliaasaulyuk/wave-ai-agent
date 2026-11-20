@@ -32,8 +32,12 @@ Rules:
 Return JSON only: {"status": "...", "answer": "...", "sources": ["<article id>", ...], "confidence": <0..1>}`;
 
 exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") return { statusCode: 405, body: "Method not allowed" };
   const key = process.env.GEMINI_API_KEY;
+  if (event.httpMethod === "GET") {
+    // Health check: which models this key can use (no secrets returned)
+    return { statusCode: 200, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ hasKey: !!key, cached: cachedModel, candidates: CANDIDATES, available: key ? await listFlash(key) : [] }) };
+  }
+  if (event.httpMethod !== "POST") return { statusCode: 405, body: "Method not allowed" };
   if (!key) return { statusCode: 503, body: JSON.stringify({ error: "no_key" }) };
 
   let body;
@@ -54,14 +58,25 @@ exports.handler = async (event) => {
   const kbText = kb.map(a => `[${a.id}] ${a.title}\n${String(a.content).slice(0, 1200)}`).join("\n\n");
   const prompt = `${SYSTEM}\n${extra}\n\nKNOWLEDGE BASE:\n${kbText}\n\nCUSTOMER QUESTION:\n${question}`;
 
-  const call = (model) => fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.2, responseMimeType: "application/json" }
-    })
-  });
+  // Fast replies matter in chat: turn thinking down where the model supports it, and never wait too long.
+  const thinking = (model) => /2\.5/.test(model) ? { thinkingBudget: 0 } : { thinkingLevel: "low" };
+  const call = async (model, withThinking = true) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      const generationConfig = { temperature: 0.2, responseMimeType: "application/json" };
+      if (withThinking) generationConfig.thinkingConfig = thinking(model);
+      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`, {
+        method: "POST", signal: ctrl.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }], generationConfig })
+      });
+      if (res.status === 400 && withThinking) return call(model, false);
+      return res;
+    } catch (e) {
+      return { ok: false, status: 408 };
+    } finally { clearTimeout(timer); }
+  };
 
   try {
     const tried = cachedModel ? [cachedModel] : [...CANDIDATES];
@@ -70,7 +85,7 @@ exports.handler = async (event) => {
       r = await call(tried[i]);
       if (r.ok) { used = tried[i]; break; }
       lastStatus = r.status;
-      if (r.status !== 404 && r.status !== 400) break;
+      if (![404, 400, 408].includes(r.status)) break;
       if (i === tried.length - 1 && !listed) {
         listed = true;
         const more = (await listFlash(key)).filter(m => !tried.includes(m));
